@@ -1,8 +1,8 @@
 # OVGGT: O(1) Constant-Cost Streaming Visual Geometry Transformer
 
 <p align="center">
-  <a href="#"><img src="https://img.shields.io/badge/arXiv-OVGGT-b31b1b" alt="https://arxiv.org/abs/2603.05959"></a>
-  <a href="#"><img src="https://img.shields.io/badge/Project%20Page-online-green" alt="https://vaisr.github.io/OVGGT"></a>
+  <a href="https://arxiv.org/abs/2603.05959"><img src="https://img.shields.io/badge/arXiv-OVGGT-b31b1b" alt="https://arxiv.org/abs/2603.05959"></a>
+  <a href="https://vaisr.github.io/OVGGT"><img src="https://img.shields.io/badge/Project%20Page-online-green" alt="https://vaisr.github.io/OVGGT"></a>
 </p>
 
 <!-- **[Si-Yu Lu]()<sup>1</sup>, [Po-Ting Chen]()<sup>2</sup>, [Hui-Che Hsu]()<sup>2</sup>, [Sin-Ye Jhong]()<sup>2</sup>, [Wen-Huang Cheng]()<sup>1</sup>, [Yung-Yao Chen]()<sup>2</sup>** -->
