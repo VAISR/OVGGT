@@ -100,6 +100,7 @@ class Attention(nn.Module):
         importance_scores: torch.Tensor = None,
         num_new_tokens: int = 0,
         importance_weight: float = 0.5,
+        window_token_count: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, float, Optional[torch.Tensor]]:
         """
         Evicts tokens from the key-value cache using hybrid scoring strategy.
@@ -129,12 +130,29 @@ class Attention(nn.Module):
         if N <= cache_budget:
             return k, v, None, None
 
-        anchor_k, candidate_k = k.split([num_anchor_tokens, N - num_anchor_tokens], dim=2)
-        anchor_v, candidate_v = v.split([num_anchor_tokens, N - num_anchor_tokens], dim=2)
+        if cache_budget <= num_anchor_tokens:
+            anchor_k = k[:, :, :num_anchor_tokens, :]
+            anchor_v = v[:, :, :num_anchor_tokens, :]
+            anchor_indices = torch.arange(num_anchor_tokens, device=k.device).unsqueeze(0).expand(B, -1)
+            return anchor_k, anchor_v, None, anchor_indices
 
-        num_candidates = N - num_anchor_tokens
-        num_to_keep_from_candidates = min(max(cache_budget - num_anchor_tokens, 0), num_candidates)
-        num_old_candidates = max(num_candidates - num_new_tokens, 0)
+        window_token_count = 0 if window_token_count is None else int(window_token_count)
+        window_token_count = max(window_token_count, 0)
+        max_tail = max(N - num_anchor_tokens, 0)
+        tail_count = min(window_token_count, max(cache_budget - num_anchor_tokens, 0), max_tail)
+        tail_start = N - tail_count if tail_count > 0 else N
+
+        anchor_k = k[:, :, :num_anchor_tokens, :]
+        anchor_v = v[:, :, :num_anchor_tokens, :]
+        tail_k = k[:, :, tail_start:, :] if tail_count > 0 else None
+        tail_v = v[:, :, tail_start:, :] if tail_count > 0 else None
+        candidate_k = k[:, :, num_anchor_tokens:tail_start, :]
+        candidate_v = v[:, :, num_anchor_tokens:tail_start, :]
+
+        num_candidates = candidate_k.shape[2]
+        num_to_keep_from_candidates = min(max(cache_budget - num_anchor_tokens - tail_count, 0), num_candidates)
+        num_new_candidates = max(num_new_tokens - tail_count, 0)
+        num_old_candidates = max(num_candidates - num_new_candidates, 0)
 
         # Edge case: if we can keep all candidates
         if num_to_keep_from_candidates >= num_candidates:
@@ -143,6 +161,12 @@ class Attention(nn.Module):
         # Edge case: budget is too small (occupied by anchors), keep only anchors
         if num_to_keep_from_candidates <= 0:
             anchor_indices = torch.arange(num_anchor_tokens, device=k.device).unsqueeze(0).expand(B, -1)
+            if tail_count > 0:
+                tail_indices = torch.arange(tail_start, N, device=k.device).unsqueeze(0).expand(B, -1)
+                kept_indices = torch.cat([anchor_indices, tail_indices], dim=-1)
+                final_k = torch.cat([anchor_k, tail_k], dim=2)
+                final_v = torch.cat([anchor_v, tail_v], dim=2)
+                return final_k, final_v, None, kept_indices
             return anchor_k, anchor_v, None, anchor_indices
 
         # Compute baseline scores (cosine diversity) for ALL candidates
@@ -155,17 +179,19 @@ class Attention(nn.Module):
         baseline_diversity_avg = baseline_diversity.mean(dim=1)  # [B, N_cand]
 
         # Check if we can use hybrid scoring
+        if importance_scores is not None and num_new_candidates > 0:
+            importance_scores = importance_scores[:, :num_new_candidates]
         use_hybrid = (
             importance_scores is not None
-            and importance_scores.shape[1] == num_new_tokens
-            and num_new_tokens > 0
+            and importance_scores.shape[1] == num_new_candidates
+            and num_new_candidates > 0
             and num_old_candidates > 0
         )
 
         if use_hybrid:
             # Hybrid strategy: baseline for old, repr_shift for new
             old_scores = baseline_diversity_avg[:, :num_old_candidates]  # [B, N_old]
-            new_importance = importance_scores  # [B, N_new]
+            new_importance = importance_scores  # [B, N_new_candidates]
 
             # Normalize both to [0, 1] range for fair comparison
             old_min, old_max = old_scores.min(dim=-1, keepdim=True)[0], old_scores.max(dim=-1, keepdim=True)[0]
@@ -192,7 +218,11 @@ class Attention(nn.Module):
             # Build kept_indices
             anchor_indices = torch.arange(num_anchor_tokens, device=k.device).unsqueeze(0).expand(B, -1)
             kept_candidate_indices = top_indices_sorted + num_anchor_tokens
-            kept_indices = torch.cat([anchor_indices, kept_candidate_indices], dim=-1)
+            if tail_count > 0:
+                tail_indices = torch.arange(tail_start, N, device=k.device).unsqueeze(0).expand(B, -1)
+                kept_indices = torch.cat([anchor_indices, kept_candidate_indices, tail_indices], dim=-1)
+            else:
+                kept_indices = torch.cat([anchor_indices, kept_candidate_indices], dim=-1)
         else:
             # Fallback: pure baseline (cosine diversity)
             avg_scores = baseline_scores.mean().item()
@@ -206,13 +236,21 @@ class Attention(nn.Module):
             # Build kept_indices (use first head's indices)
             anchor_indices = torch.arange(num_anchor_tokens, device=k.device).unsqueeze(0).expand(B, -1)
             kept_candidate_indices = top_indices_sorted[:, 0, :] + num_anchor_tokens
-            kept_indices = torch.cat([anchor_indices, kept_candidate_indices], dim=-1)
+            if tail_count > 0:
+                tail_indices = torch.arange(tail_start, N, device=k.device).unsqueeze(0).expand(B, -1)
+                kept_indices = torch.cat([anchor_indices, kept_candidate_indices, tail_indices], dim=-1)
+            else:
+                kept_indices = torch.cat([anchor_indices, kept_candidate_indices], dim=-1)
 
         kept_candidate_k = torch.gather(candidate_k, 2, expanded_indices)
         kept_candidate_v = torch.gather(candidate_v, 2, expanded_indices)
 
-        final_k = torch.cat([anchor_k, kept_candidate_k], dim=2)
-        final_v = torch.cat([anchor_v, kept_candidate_v], dim=2)
+        if tail_count > 0:
+            final_k = torch.cat([anchor_k, kept_candidate_k, tail_k], dim=2)
+            final_v = torch.cat([anchor_v, kept_candidate_v, tail_v], dim=2)
+        else:
+            final_k = torch.cat([anchor_k, kept_candidate_k], dim=2)
+            final_v = torch.cat([anchor_v, kept_candidate_v], dim=2)
 
         return final_k, final_v, avg_scores, kept_indices
 
@@ -228,6 +266,7 @@ class Attention(nn.Module):
         defer_eviction=False,
         anchor_token_count: int = None,
         importance_weight: float = 0.5,
+        window_token_count: int = 0,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Tuple]]:
         """
         Forward pass with optional two-stage eviction support.
@@ -274,6 +313,7 @@ class Attention(nn.Module):
                         importance_scores=importance_scores,
                         num_new_tokens=num_new_tokens,
                         importance_weight=importance_weight,
+                        window_token_count=window_token_count,
                     )
                 new_kv = (k, v, kept_indices)
             else:

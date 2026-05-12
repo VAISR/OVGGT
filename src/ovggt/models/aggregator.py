@@ -213,6 +213,7 @@ class Aggregator(nn.Module):
         total_budget=0,
         anchor_token_count: int = None,
         importance_weight: float = 0.5,
+        window_token_count: int = 0,
     ) -> Tuple[List[torch.Tensor], int]:
         """
         Args:
@@ -319,6 +320,7 @@ class Aggregator(nn.Module):
                             intra_frame_keep_ratio=self.intra_frame_keep_ratio,
                             anchor_token_count=anchor_token_count,
                             importance_weight=importance_weight,
+                            window_token_count=window_token_count,
                         )
 
                         # Pass new importance to next layer (within same frame)
@@ -389,6 +391,7 @@ class Aggregator(nn.Module):
         intra_frame_keep_ratio=1.0,
         anchor_token_count: int = None,
         importance_weight: float = 0.5,
+        window_token_count: int = 0,
     ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List]]:
         """
         Process global attention blocks. We keep tokens in shape (B, S*P, C).
@@ -436,6 +439,7 @@ class Aggregator(nn.Module):
                     intra_frame_keep_ratio=effective_keep_ratio,
                     anchor_token_count=anchor_token_count,
                     importance_weight=importance_weight,
+                    window_token_count=window_token_count,
                 )
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
@@ -463,6 +467,173 @@ class Aggregator(nn.Module):
             budgets = proportions * total_budget
 
         return budgets.int()
+
+    def sync_anchor_change(
+        self,
+        past_key_values,
+        anchor_token_count: int,
+        tokens_per_frame: int,
+        anchor_keep_ratio: float,
+        anchor_token_indices: Optional[torch.Tensor] = None,
+        is_fifo: bool = False,
+    ):
+        """
+        Rearrange global KV cache after registering a history anchor.
+
+        This promotes a chunk of the newest frame's tokens into the anchor
+        zone (first anchor_token_count tokens) so it is protected by eviction.
+        If anchor_token_indices are provided, the promotion uses those indices
+        (relative to the new frame token segment), typically ranked by point
+        head confidence.
+
+        Args:
+            past_key_values: list of (k, v) per layer
+            anchor_token_count: anchor zone size AFTER the change
+            tokens_per_frame: number of tokens per frame (camera + register + patches)
+            anchor_keep_ratio: fraction of each anchor frame to protect
+            anchor_token_indices: indices within the new frame segment to promote
+            is_fifo: whether FIFO demotion occurred (oldest history anchor demoted)
+
+        Returns:
+            Modified past_key_values
+        """
+        if past_key_values is None or anchor_token_count is None:
+            return past_key_values
+
+        if anchor_token_count <= tokens_per_frame:
+            return past_key_values
+
+        if anchor_token_indices is not None:
+            anchor_chunk = anchor_token_indices.shape[-1]
+        else:
+            anchor_chunk = max(int(tokens_per_frame * anchor_keep_ratio), 1)
+        anchor_chunk = min(anchor_chunk, tokens_per_frame)
+        global_anchor_end = tokens_per_frame
+
+        for idx in range(self.depth):
+            if past_key_values[idx] is None:
+                continue
+
+            k, v = past_key_values[idx]
+            N = k.shape[2]
+
+            if N <= anchor_token_count:
+                continue
+
+            new_frame_start = N - tokens_per_frame
+            if new_frame_start < 0:
+                continue
+
+            # If the new frame already overlaps the anchor zone, skip reordering.
+            if new_frame_start < anchor_token_count:
+                continue
+
+            if anchor_chunk <= 0:
+                continue
+
+            new_frame_anchor_end = min(new_frame_start + anchor_chunk, N)
+            if anchor_token_indices is not None:
+                k_frame = k[:, :, new_frame_start:new_frame_start + tokens_per_frame, :]
+                v_frame = v[:, :, new_frame_start:new_frame_start + tokens_per_frame, :]
+                frame_indices = torch.arange(tokens_per_frame, device=k.device)
+
+                if anchor_token_indices.dim() == 1:
+                    anchor_token_indices_exp = anchor_token_indices.unsqueeze(0).expand(k.shape[0], -1)
+                else:
+                    anchor_token_indices_exp = anchor_token_indices
+
+                selected_k = []
+                selected_v = []
+                remaining_k = []
+                remaining_v = []
+
+                for b in range(k.shape[0]):
+                    selected = anchor_token_indices_exp[b]
+                    selected = selected[(selected >= 0) & (selected < tokens_per_frame)]
+                    if selected.numel() == 0:
+                        continue
+
+                    mask = torch.ones(tokens_per_frame, device=k.device, dtype=torch.bool)
+                    mask[selected] = False
+                    remaining = frame_indices[mask]
+
+                    selected_k.append(k_frame[b:b + 1, :, selected, :])
+                    selected_v.append(v_frame[b:b + 1, :, selected, :])
+                    remaining_k.append(k_frame[b:b + 1, :, remaining, :])
+                    remaining_v.append(v_frame[b:b + 1, :, remaining, :])
+
+                if not selected_k:
+                    continue
+
+                k_selected = torch.cat(selected_k, dim=0)
+                v_selected = torch.cat(selected_v, dim=0)
+                k_remaining = torch.cat(remaining_k, dim=0)
+                v_remaining = torch.cat(remaining_v, dim=0)
+            else:
+                k_selected = k[:, :, new_frame_start:new_frame_anchor_end, :]
+                v_selected = v[:, :, new_frame_start:new_frame_anchor_end, :]
+                k_remaining = k[:, :, new_frame_anchor_end:new_frame_start + tokens_per_frame, :]
+                v_remaining = v[:, :, new_frame_anchor_end:new_frame_start + tokens_per_frame, :]
+
+            if is_fifo:
+                demote_start = global_anchor_end
+                demote_end = min(global_anchor_end + anchor_chunk, anchor_token_count)
+                if demote_end <= demote_start:
+                    continue
+
+                k_new = torch.cat(
+                    [
+                        k[:, :, :demote_start, :],
+                        k[:, :, demote_end:anchor_token_count, :],
+                        k_selected,
+                        k[:, :, anchor_token_count:new_frame_start, :],
+                        k_remaining,
+                        k[:, :, new_frame_start + tokens_per_frame:, :],
+                        k[:, :, demote_start:demote_end, :],
+                    ],
+                    dim=2,
+                )
+                v_new = torch.cat(
+                    [
+                        v[:, :, :demote_start, :],
+                        v[:, :, demote_end:anchor_token_count, :],
+                        v_selected,
+                        v[:, :, anchor_token_count:new_frame_start, :],
+                        v_remaining,
+                        v[:, :, new_frame_start + tokens_per_frame:, :],
+                        v[:, :, demote_start:demote_end, :],
+                    ],
+                    dim=2,
+                )
+            else:
+                old_anchor_end = max(anchor_token_count - anchor_chunk, global_anchor_end)
+                if old_anchor_end > new_frame_start:
+                    continue
+
+                k_new = torch.cat(
+                    [
+                        k[:, :, :old_anchor_end, :],
+                        k_selected,
+                        k[:, :, old_anchor_end:new_frame_start, :],
+                        k_remaining,
+                        k[:, :, new_frame_start + tokens_per_frame:, :],
+                    ],
+                    dim=2,
+                )
+                v_new = torch.cat(
+                    [
+                        v[:, :, :old_anchor_end, :],
+                        v_selected,
+                        v[:, :, old_anchor_end:new_frame_start, :],
+                        v_remaining,
+                        v[:, :, new_frame_start + tokens_per_frame:, :],
+                    ],
+                    dim=2,
+                )
+
+            past_key_values[idx] = (k_new, v_new)
+
+        return past_key_values
 
 
 def slice_expand_and_flatten(token_tensor, B, S):

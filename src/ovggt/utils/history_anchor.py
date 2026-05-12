@@ -29,6 +29,8 @@ class HistoryAnchorConfig:
 
     strategy: str = 'none'       # 'none', 'fixed_interval', or 'coverage'
     interval: int = 50           # Fixed interval (e.g., 25, 50, 100)
+    # Minimum frame interval between coverage anchors (None = use interval)
+    min_anchor_interval: Optional[int] = None
     # Maximum number of history anchors (excluding Global Anchor)
     max_anchors: int = 3
     # Coverage-based parameters
@@ -224,6 +226,9 @@ class HistoryAnchorManager:
         # Next anchor target frame (for fixed_interval)
         self.next_anchor_frame: int = config.interval
 
+        # Last history anchor frame (for coverage min-interval gating)
+        self.last_anchor_frame: Optional[int] = None
+
         # Coverage-based: store latest anchor's depth and pose
         self.latest_anchor_depth: Optional[torch.Tensor] = None
         self.latest_anchor_pose: Optional[torch.Tensor] = None
@@ -374,6 +379,15 @@ class HistoryAnchorManager:
         if coverage >= self.config.coverage_threshold:
             return False, False, f'coverage_{coverage:.3f}>=threshold_{self.config.coverage_threshold}', coverage
 
+        # Enforce minimum frame interval between history anchors
+        if self.last_anchor_frame is not None:
+            base_interval = self.config.min_anchor_interval
+            if base_interval is None:
+                base_interval = self.config.interval
+            min_interval = max(base_interval, 0)
+            if (frame_idx - self.last_anchor_frame) < min_interval:
+                return False, False, f'min_interval_{min_interval}_not_met', coverage
+
         # Coverage below threshold: need new anchor
         is_fifo = self.num_history_anchors >= self.config.max_anchors
         return True, is_fifo, f'coverage_{coverage:.3f}<threshold_{self.config.coverage_threshold}', coverage
@@ -396,6 +410,7 @@ class HistoryAnchorManager:
             pose: Camera pose of the new anchor frame
         """
         self.register_anchor(frame_idx)
+        self.last_anchor_frame = frame_idx
         self.latest_anchor_depth = depth.clone()
         self.latest_anchor_pose = pose.clone()
 

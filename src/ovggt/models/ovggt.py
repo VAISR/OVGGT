@@ -1,6 +1,7 @@
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
 
 from ovggt.models.aggregator import Aggregator
@@ -136,6 +137,8 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
         cache_results: bool = True,
         history_anchor_strategy: str = 'coverage',
         anchor_interval: int = 250,
+        min_anchor_interval: Optional[int] = 100,
+        window_protect_frames: int = 0,
         max_anchors: int = 3,
         coverage_threshold: float = 0.2,
         anchor_keep_ratio: float = 0.05,
@@ -157,11 +160,13 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
         patch_size = self.aggregator.patch_size
         num_patches = (img_h // patch_size) * (img_w // patch_size)
         tokens_per_frame = 1 + 4 + num_patches  # camera + register + patches
+        window_token_count = max(int(window_protect_frames), 0) * tokens_per_frame
 
         # Initialize History Anchor Manager (count-based with FIFO)
         anchor_config = HistoryAnchorConfig(
             strategy=history_anchor_strategy,
             interval=anchor_interval,
+            min_anchor_interval=min_anchor_interval,
             max_anchors=max_anchors,
             coverage_threshold=coverage_threshold,
             anchor_keep_ratio=anchor_keep_ratio,
@@ -171,6 +176,34 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
 
         all_ress = []
         processed_frames = []
+
+        def _select_anchor_token_indices(conf_map: torch.Tensor) -> Optional[torch.Tensor]:
+            if conf_map is None:
+                return None
+
+            special_count = self.aggregator.patch_start_idx
+            anchor_chunk = max(int(tokens_per_frame * anchor_keep_ratio), 1)
+            if anchor_chunk <= special_count:
+                return torch.arange(anchor_chunk, device=conf_map.device).unsqueeze(0).expand(conf_map.shape[0], -1)
+
+            keep_patches = anchor_chunk - special_count
+            patch_h = img_h // patch_size
+            patch_w = img_w // patch_size
+
+            if conf_map.dim() == 4:
+                conf_map = conf_map.squeeze(1)
+            if conf_map.dim() != 3:
+                return None
+
+            pooled = F.adaptive_avg_pool2d(conf_map.unsqueeze(1), (patch_h, patch_w)).squeeze(1)
+            flat = pooled.reshape(conf_map.shape[0], -1)
+            keep_patches = min(keep_patches, flat.shape[1])
+            if keep_patches <= 0:
+                return torch.arange(anchor_chunk, device=conf_map.device).unsqueeze(0).expand(conf_map.shape[0], -1)
+
+            topk = torch.topk(flat, k=keep_patches, dim=1).indices
+            special_indices = torch.arange(special_count, device=conf_map.device).unsqueeze(0).expand(conf_map.shape[0], -1)
+            return torch.cat([special_indices, topk + special_count], dim=1)
 
         for i, frame in enumerate(frames):
             # For fixed_interval: decision happens BEFORE inference
@@ -199,6 +232,7 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
                 total_budget=total_budget,  
                 anchor_token_count=anchor_token_count,
                 importance_weight=importance_weight,
+                window_token_count=window_token_count,
             )
 
 
@@ -254,6 +288,17 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
                     vis = vis[:, 0]
                     track_conf = conf[:, 0]
 
+            if fixed_interval_registered:
+                anchor_token_indices = _select_anchor_token_indices(pts3d_conf if self.point_head is not None else None)
+                past_key_values = self.aggregator.sync_anchor_change(
+                    past_key_values,
+                    anchor_token_count=anchor_token_count,
+                    tokens_per_frame=tokens_per_frame,
+                    anchor_keep_ratio=anchor_keep_ratio,
+                    anchor_token_indices=anchor_token_indices,
+                    is_fifo=fixed_interval_is_fifo,
+                )
+
             # For coverage strategy: decision happens AFTER depth/pose are available
             if history_anchor_strategy == 'coverage':
                 should_register, is_fifo, reason, coverage = anchor_manager.should_become_anchor_coverage(
@@ -265,6 +310,17 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
                     anchor_manager.register_anchor_coverage(i, depth[0], camera_pose[0])
                     fifo_msg = " (FIFO: oldest demoted)" if is_fifo else ""
                     print(f"[History Anchor] Frame {i} registered{fifo_msg}: {reason}")
+
+                    anchor_token_count_post = anchor_manager.get_protected_token_count()
+                    anchor_token_indices = _select_anchor_token_indices(pts3d_conf if self.point_head is not None else None)
+                    past_key_values = self.aggregator.sync_anchor_change(
+                        past_key_values,
+                        anchor_token_count=anchor_token_count_post,
+                        tokens_per_frame=tokens_per_frame,
+                        anchor_keep_ratio=anchor_keep_ratio,
+                        anchor_token_indices=anchor_token_indices,
+                        is_fifo=is_fifo,
+                    )
 
                     # Sync camera KV cache anchor zone with Aggregator's FIFO/promotion.
                     cam_anchor_count_post = anchor_manager.get_num_anchors() * 4
