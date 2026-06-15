@@ -41,6 +41,30 @@ def completion(gt_points, rec_points, gt_normals=None, rec_normals=None):
     return comp, comp_median
 
 
+def compute_chamfer_distance(points_pred, points_gt, max_dist=None):
+    """Symmetric Chamfer distance between two point clouds.
+
+    For every predicted point we take the distance to its nearest ground-truth
+    point (the accuracy term) and vice versa (the completeness term); the Chamfer
+    distance returned here is the sum of the two mean distances. When ``max_dist``
+    is given, per-point distances are clipped to it so that a few gross outliers
+    cannot dominate the average.
+    """
+    points_pred = np.asarray(points_pred)
+    points_gt = np.asarray(points_gt)
+    if len(points_pred) == 0 or len(points_gt) == 0:
+        return float("nan")
+
+    dist_pred_to_gt, _ = KDTree(points_gt).query(points_pred, workers=-1)
+    dist_gt_to_pred, _ = KDTree(points_pred).query(points_gt, workers=-1)
+
+    if max_dist is not None:
+        dist_pred_to_gt = np.clip(dist_pred_to_gt, None, max_dist)
+        dist_gt_to_pred = np.clip(dist_gt_to_pred, None, max_dist)
+
+    return float(dist_pred_to_gt.mean() + dist_gt_to_pred.mean())
+
+
 def compute_iou(pred_vox, target_vox):
     # Get voxel indices
     v_pred_indices = [voxel.grid_index for voxel in pred_vox.get_voxels()]
