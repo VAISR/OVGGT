@@ -1,14 +1,15 @@
 # OVGGT: O(1) Constant-Cost Streaming Visual Geometry Transformer
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2603.05959"><img src="https://img.shields.io/badge/arXiv-OVGGT-b31b1b" alt="https://arxiv.org/abs/2603.05959"></a>
-  <a href="https://vaisr.github.io/OVGGT"><img src="https://img.shields.io/badge/Project%20Page-online-green" alt="https://vaisr.github.io/OVGGT"></a>
+  <a href="https://arxiv.org/abs/2603.05959"><img src="https://img.shields.io/badge/arXiv-2603.05959-b31b1b" alt="https://arxiv.org/abs/2603.05959"></a>
+  <a href="https://vaisr.github.io/OVGGT"><img src="https://img.shields.io/badge/Project%20Page-OVGGT-green" alt="https://vaisr.github.io/OVGGT"></a>
+  <a href="https://vaisr.github.io/OVGGT"><img src="https://img.shields.io/badge/ECCV-2026-blue" alt="ECCV 2026"></a>
 </p>
 
-<!-- **[Si-Yu Lu]()<sup>1</sup>, [Po-Ting Chen]()<sup>2</sup>, [Hui-Che Hsu]()<sup>2</sup>, [Sin-Ye Jhong]()<sup>2</sup>, [Wen-Huang Cheng]()<sup>1</sup>, [Yung-Yao Chen]()<sup>2</sup>** -->
-**Si-Yu Lu<sup>1</sup>, Po-Ting Chen<sup>2</sup>, Hui-Che Hsu<sup>2</sup>, Sin-Ye Jhong<sup>2</sup>, Wen-Huang Cheng<sup>1</sup>, Yung-Yao Chen<sup>2</sup>**
 
-<sup>1</sup>National Taiwan University &nbsp;&nbsp; <sup>2</sup>National Taiwan University of Science and Technology
+Si-Yu Lu, Po-Ting Chen, Hui-Che Hsu, Sin-Ye Jhong, Wen-Huang Cheng, Yung-Yao Chen
+
+<!-- <sup>1</sup>National Taiwan University &nbsp;&nbsp; <sup>2</sup>National Taiwan University of Science and Technology -->
 
 ---
 
@@ -24,6 +25,9 @@
 
 ## News
 
+- **[2026.07]** 🎉 OVGGT is accepted to ECCV 2026.
+- **[2026.03]** Paper released on [arXiv](https://arxiv.org/abs/2603.05959) and [project page](https://vaisr.github.io/OVGGT).
+
 ## Overview
 
 OVGGT is a **training-free** framework that enables streaming 3D reconstruction from arbitrarily long video with **constant memory and compute**. It combines *Self-Selective Caching* (SSC) for zero-overhead KV cache compression via FFN residual magnitudes, and *Dynamic Anchor Protection* (DAP) to shield geometrically critical tokens from eviction, suppressing coordinate drift over long sequences. OVGGT is fully compatible with FlashAttention and processes videos within a fixed VRAM envelope while surpassing full-cache baselines in accuracy.
@@ -36,7 +40,7 @@ OVGGT is a **training-free** framework that enables streaming 3D reconstruction 
 
 1. Clone OVGGT
 ```bash
-git clone https://github.com/<your-username>/OVGGT.git
+git clone https://github.com/VAISR/OVGGT.git
 cd OVGGT
 ```
 
