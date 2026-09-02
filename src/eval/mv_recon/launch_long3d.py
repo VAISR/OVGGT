@@ -404,7 +404,8 @@ def main(args):
 
                     # 8. Alignment: RANSAC global registration + ICP refinement.
                     start_alignment = time.time()
-                    reg_voxel_size = 0.05
+                    # make sure the settings will not fail
+                    reg_voxel_size = 0.2 if is_sparse_scene else 0.05
                     source_down, src_fpfh = prepare_for_registration(pcd_pred_ds, reg_voxel_size)
                     target_down, tgt_fpfh = prepare_for_registration(pcd_gt_ds, reg_voxel_size)
                     distance_threshold = 1.5 if is_sparse_scene else reg_voxel_size * 5
